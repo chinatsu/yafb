@@ -1,0 +1,13 @@
+[package]
+
+name = "yafb"
+version = "0.0.9"
+authors = [ "chinatsu" ]
+
+[dependencies]
+
+winapi = "0.2.6"
+kernel32-sys = "0.2.0"
+user32-sys = "0.1.2"
+lazy_static = "0.1.15"
+rust-ini = "0.9.4"
