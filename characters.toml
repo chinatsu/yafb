@@ -1,0 +1,24 @@
+[[account]]
+account = "pinyin"
+name = "Somnolent"
+collect = false
+
+[[account]]
+account = "pinyin2"
+name = "Vengeance"
+collect = true
+
+[[account]]
+account = "pinyin3"
+name = "Absurd"
+collect = false
+
+[[account]]
+account = "pinyin5"
+name = "Scarlet"
+collect = true
+
+[[account]]
+account = "pinyin6"
+name = "Marisa"
+collect = true

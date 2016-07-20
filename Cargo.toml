@@ -1,13 +1,16 @@
 [package]
 
 name = "yafb"
-version = "0.0.9"
+version = "0.10.1"
 authors = [ "chinatsu" ]
 
 [dependencies]
 
+rustc-serialize = "0.3.19"
+time = "0.1"
 winapi = "0.2.6"
 kernel32-sys = "0.2.0"
 user32-sys = "0.1.2"
 lazy_static = "0.1.15"
-rust-ini = "0.9.4"
+toml = "0.1.30"
+toml-config = "0.3.0"

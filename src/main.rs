@@ -1,46 +1,34 @@
 // TODO: Clean up the HWND bullshit, somehow
-
+#![feature(custom_derive)]
 extern crate kernel32;
 extern crate user32;
 extern crate winapi;
-extern crate ini;
+extern crate time;
 #[macro_use]
 extern crate lazy_static;
+extern crate rustc_serialize;
+extern crate toml_config;
 
-use ini::Ini;
+mod implying;
+use implying::*;
+mod wide;
+use wide::ToWide;
+
+use std::path::Path;
+use toml_config::ConfigFactory;
+
 use std::io;
 use std::io::prelude::*;
-use std::os::windows::ffi::OsStringExt;
 use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 use std::sync::Arc;
 use std::sync::Mutex;
-
-#[derive(Debug)]
-#[derive(Clone)]
-struct Client {
-    pid: u32,
-    hwnd: u32, // I don't seem to be able to use winapi::windef::HWND as type directly here.
-    name: String,
-    collect: bool,
-    offx: i32, // X offset for collecting purposes
-    offy: i32, // Y offset for collecting purposes
-}
-
-#[derive(Debug)]
-struct Setup {
-    timeout: u64,
-    keysel: u64,
-}
-
+use std::iter::Iterator;
 
 // Global list of clients, wrapped in a bunch of magic
 lazy_static! {
     static ref CLIENTS: Arc<Mutex<Vec<Client>>> = Arc::new(Mutex::new(Vec::new()));
-}
-
-// Reading this once here feels nicer than calling load_from_file whenever I want to use it
-lazy_static! {
-    static ref CONF: Ini = Ini::load_from_file("config.ini").unwrap();
+    static ref CONFIG: Config = ConfigFactory::load(Path::new("yafb.toml"));
 }
 
 // (r (x, y)), where r is the sum of a client's height and width,
@@ -74,8 +62,7 @@ fn main() {
         println!("Running spammer on {}", client.name);
         loop {
             if unsafe { user32::IsWindow(hwnd) == 0 } {
-                println!("Client: {} no longer exists!", &client.name);
-                std::thread::park();
+                raise_error(format!("Client: {} no longer exists!", client.name));
             }
             push_button(hwnd, setup.keysel, 500);
             std::thread::sleep(timeout);
@@ -90,27 +77,28 @@ fn main() {
                 cl.push(client.to_owned());
             }
         }
-        if cl.len() != 0 {
+        println!("[Note] There is a modifier setting in yafb.toml,\n
+        increasing this value will slow down battery changes if the default (1) is too fast\n");
+        if !cl.is_empty() {
             println!("Found {} connected collectors:", cl.len());
             for c in &cl {
                 println!("  {}", c.name);
             }
             let setup = setup(true);
             let timeout = std::time::Duration::new(setup.timeout, 0);
+            let modifier: u64 = CONFIG.collector.modifier;
             loop {
                 for client in &cl {
                     if unsafe { user32::IsWindow(client.hwnd as winapi::windef::HWND) } == 0 {
-                        println!("Client: {} no longer exists!", &client.name);
-                        std::thread::park();
+                        raise_error(format!("Client: {} no longer exists!", client.name));
                     }
-                    change_battery(&client, setup.keysel);
-                    std::thread::sleep(std::time::Duration::new(1, 0));
+                    change_battery(client, setup.keysel);
+                    std::thread::sleep(std::time::Duration::new(modifier, 0));
                 }
                 std::thread::sleep(timeout);
             }
         } else {
-            println!("No configured collectors logged on!");
-            std::thread::park();
+            raise_error(format!("No configured collectors logged on!"));
         }
 
     }
@@ -120,14 +108,14 @@ fn main() {
         // pressing D to turn the character at set intervals to have the player run in circles.
         let procs = enum_clients();
         let client = prompt_user(procs);
-        let timeout = CONF["kitebot"]["timeout"].trim_right().parse::<u64>().ok().unwrap();
-        let keytime = CONF["kitebot"]["keytime"].trim_right().parse::<u64>().ok().unwrap();
+        let keytime = CONFIG.kitebot.keytime;
+        let timeout = CONFIG.kitebot.timeout;
         let hwnd: winapi::windef::HWND = client.hwnd as winapi::windef::HWND;
         println!("Running kitebot on {}", client.name);
         loop {
             if unsafe { user32::IsWindow(hwnd) } == 0 {
-                println!("Client: {} no longer exists!", &client.name);
-                std::thread::park();
+                let errmsg = format!("Client: {} no longer exists!", client.name);
+                raise_error(errmsg);
             }
             push_button(hwnd, 0x44, keytime);
             std::thread::sleep(std::time::Duration::from_millis(timeout));
@@ -135,80 +123,155 @@ fn main() {
     }
     if mode == 3 {
         // "Test"-mode. Currently hardcoded, don't bother using.
+        println!("[Warning!] This mode is highly unstable, and will cause weird behavior");
         let procs = enum_clients();
         let client = prompt_user(procs);
-        let hwnd: winapi::windef::HWND = client.hwnd as winapi::windef::HWND;
+        let offset = u32::from_str_radix(&CONFIG.dungeons.offset, 16).ok().unwrap();
+        let off2 = u32::from_str_radix("164", 16).ok().unwrap();
         let address = get_base_addr(client.pid);
-        let offset = u32::from_str_radix("00867CD8", 16).ok().unwrap();
-        let x = u32::from_str_radix("164", 16).ok().unwrap();
-        let position: [f32; 3] = [845.28503, 57.0, 1275.8212];
-        let mut pointer = read_memory(client.pid, address + offset);
-        change_pos(client.pid, pointer + x, position);
+        let ref sel: Dungeon;
+        let mut count = 0;
+        println!("Available dungeons:");
+        for k in &CONFIG.dungeon {
+            println!("[{}] {}", count, k.name);
+            count += 1;
+        }
         loop {
-            pointer = read_memory(client.pid, address + offset);
-            let xpos: f32 = unsafe { std::mem::transmute(read_memory(client.pid, pointer + x)) };
-            let zpos: f32 =
-                unsafe { std::mem::transmute(read_memory(client.pid, pointer + x + 8)) };
-            let ypos: f32 =
-                unsafe { std::mem::transmute(read_memory(client.pid, pointer + x + 4)) };
-            write!(&mut io::stdout(),
-                   "x: {:?}\ty: {:?}\tz: {:?}\t\t\t\t\t\r",
-                   xpos,
-                   ypos,
-                   zpos);
-            io::stdout().flush();
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            let input = user_input("Select dungeon > ".to_string());
+            let input_opt: Option<usize> = input.trim_right().parse::<usize>().ok();
+            let input_int = match input_opt {
+                Some(input_int) => input_int,
+                None => raise_error(format!("{} is numberwang!", input.trim_right())),
+            };
+            if input_int <= CONFIG.dungeon.len() {
+                sel = &CONFIG.dungeon[input_int];
+                break;
+            } else {
+                let errmsg = format!("{} is too high!", input_int);
+                raise_error(errmsg);
+            }
+        }
+        println!("[Warning!] You must be currently in the dungeon to teleport without crashing");
+        count = 0;
+        for loc in &sel.coordinates {
+            let pointer = read_memory(client.pid, address + offset) + off2;
+            count += 1;
+            let x: f32 = loc[0];
+            let y: f32 = loc[1];
+            let z: f32 = loc[2];
+            println!("Location {} in {}, ready to teleport", count, sel.name);
+            user_input("Press enter to teleport > ".to_string());
+            change_pos(client.pid, pointer, [x, y, z]);
         }
     }
-
+    if mode == 4 {
+        let procs = enum_clients();
+        let client = prompt_user(procs);
+        println!("{}{}{}", "Running notification mode.\n",
+                "  (Might put this as an option to run during other modes)\n",
+                "---------------------------------------------------------");
+        let pid = client.pid;
+        let hwnd = client.hwnd;
+        notification(pid, hwnd);
+    }
 }
 
-fn user_input() -> String {
+
+fn notification(pid: u32, hwnd: u32) {
+    let mut new_message = String::new();
+    let offset = u32::from_str_radix(&CONFIG.systembuffer.offset, 16).ok().unwrap();
+    let off0 = u32::from_str_radix("BC", 16).ok().unwrap();
+    let off1 = u32::from_str_radix("728", 16).ok().unwrap();
+    let address = get_base_addr(pid);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let pointer = read_memory(pid, read_memory(pid, read_memory(pid, address + offset) + off0) + off1);
+        let mut r = 0;
+        let mut buffer = String::new();
+        loop {
+            let (memory, stop) = read_buffer(pid, pointer + r);
+            buffer.push_str(&memory);
+            if stop {
+                break;
+            }
+            r += 2048;
+        }
+        if buffer.lines().last().is_none() {
+            raise_error(format!("Unable to read memory, client closed or not logged in?"));
+        }
+        let message = buffer.lines().last().unwrap();
+
+        if message.chars().next().unwrap() == '[' &&
+            (&message[..8] != "[Notice]") &&
+            (message != new_message) {
+                    unsafe { user32::FlashWindow(hwnd as winapi::windef::HWND, 0) };
+                    println!("[{}] {}", time::strftime("%Y-%m-%d %H:%M:%S", &time::now()).unwrap(), message);
+                    new_message = message.to_string();
+        }
+    }
+}
+
+fn player_pos(pid: u32) {
+    let address = get_base_addr(pid);
+    let offset = u32::from_str_radix(&CONFIG.dungeons.offset, 16).ok().unwrap();
+    let x = u32::from_str_radix("164", 16).ok().unwrap();
+    loop {
+        let pointer = read_memory(pid, address + offset) + x;
+        let xpos: f32 = unsafe { std::mem::transmute(read_memory(pid, pointer)) };
+        let zpos: f32 =
+            unsafe { std::mem::transmute(read_memory(pid, pointer + 8)) };
+        let ypos: f32 =
+            unsafe { std::mem::transmute(read_memory(pid, pointer + 4)) };
+        print!("x: {:?}\ty: {:?}\tz: {:?}\t\t\t\t\t\r",
+               xpos,
+               ypos,
+               zpos);
+        let _ = io::stdout().flush();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn user_input(prompt: String) -> String {
     // I use this enough to warrant its own function.
-    let mut stdin = io::stdin();
-    let mut stdout = io::stdout();
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
     let mut input = String::new();
-    stdin.read_line(&mut input);
+    let _ = io::stdin().read_line(&mut input) ;
     input
 }
 
 fn mode_select() -> u8 {
     // Prints available modes, and prompts the user to select a desired ID (0, 1, or 2).
-    let mut mode = 0u8;
-
     println!("Available modes:");
     println!("[0] Healbot");
     println!("[1] Collector");
     println!("[2] Kitebot (broken as fuck)");
-    println!("[3] Test mode");
+    println!("[3] Dungeon teleporter (mostly untested)");
+    println!("[4] Notification mode");
     loop {
-        write!(&mut io::stdout(), "Select mode > ");
-        io::stdout().flush();
-        let mut input = user_input();
+        let input = user_input("Select mode > ".to_string());
         let input_opt: Option<usize> = input.trim_right().parse::<usize>().ok();
         let input_int = match input_opt {
             Some(input_int) => input_int,
-            None => panic!("{} is numberwang!", input.trim_right()),
+            None => raise_error(format!("{} is numberwang!", input.trim_right())),
         };
-        if input_int <= 3 {
-            mode = input_int as u8;
-            break;
+        if input_int <= 4 {
+            return input_int as u8;
         } else {
-            println!("{} is too high!", input_int);
-            std::thread::park();
+            raise_error(format!("{} is too high!", input_int));
         }
     }
-    mode
 }
 
 fn change_battery(client: &Client, key: u64) {
     let hwnd: winapi::windef::HWND = client.hwnd as winapi::windef::HWND;
+    let modifier: u64 = CONFIG.collector.modifier;
     let mut iconic = 0u8;
     if unsafe { user32::IsIconic(hwnd) } != 0 {
         iconic = 1;
         unsafe { user32::ShowWindow(hwnd, 1i32) }; // Show the window if the client is minimized.
         // Safety wait for the window restore animation to finish.
-        std::thread::sleep(std::time::Duration::new(1, 0));
+        std::thread::sleep(std::time::Duration::new(modifier, 0));
     }
     let rect = get_window_pos(hwnd);
     click_mouse(hwnd, rect.left + 83, rect.top + 187); // click "Stop"
@@ -216,10 +279,10 @@ fn change_battery(client: &Client, key: u64) {
     // The server I'm playing has an additional window
     // in an attempt to thwart existing automation tools, so let's click that first.
     click_mouse(hwnd, rect.left + client.offx + 30, rect.top + client.offy);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(200 * modifier));
     // press OK to replace battery
     click_mouse(hwnd, rect.left + client.offx, rect.top + client.offy);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_millis(500 * modifier));
     click_mouse(hwnd, rect.left + 83, rect.top + 187); // Click "Start".
     if iconic != 0 {
         // Minimize the client if it was minimized at the start.
@@ -230,7 +293,7 @@ fn change_battery(client: &Client, key: u64) {
 
 fn prompt_user(clients: Vec<Client>) -> Client {
     // Prompts the user to select a specific client.
-    let mut client;
+    let client;
     let mut count = 0u32;
     if clients.len() > 1 {
         println!("Currently open clients:");
@@ -239,19 +302,17 @@ fn prompt_user(clients: Vec<Client>) -> Client {
             count += 1;
         }
         loop {
-            write!(&mut io::stdout(), "Select client ID > ");
-            io::stdout().flush();
-            let mut input = user_input();
+            let input = user_input("Select client ID > ".to_string());
             let input_opt: Option<usize> = input.trim_right().parse::<usize>().ok();
             let input_int = match input_opt {
                 Some(input_int) => input_int,
-                None => panic!("{} is numberwang!", input.trim_right()),
+                None => raise_error(format!("{} is numberwang!", input.trim_right())),
             };
             if input_int <= clients.len() {
                 client = &clients[input_int];
                 break;
             } else {
-                panic!("{} is too high!", input_int)
+                raise_error(format!("{} is too high!", input_int));
             }
         }
     } else {
@@ -264,28 +325,24 @@ fn prompt_user(clients: Vec<Client>) -> Client {
 fn setup(collector: bool) -> Setup {
     // Prompts the user to specify timeout and target F-key, if `collector` is true,
     // the timeout will be read from the config file.
-    let mut timeout;
-    let mut fkey;
-    if collector == false {
+    let timeout;
+    let fkey;
+    if !collector {
         loop {
-            write!(&mut io::stdout(), "Select heal timeout (in seconds) > ");
-            io::stdout().flush();
-            let mut input = user_input();
+            let input = user_input("Select heal timeout (in seconds) > ".to_string());
             let input_opt: Option<usize> = input.trim_right().parse::<usize>().ok();
             let input_int = match input_opt {
                 Some(input_int) => input_int,
-                None => panic!("{} is numberwang!", input.trim_right()),
+                None => raise_error(format!("{} is numberwang!", input.trim_right())),
             };
             timeout = input_int as u64;
             break;
         }
     } else {
-        timeout = CONF["collector"]["timeout"].trim_right().parse::<u64>().ok().unwrap()
+        timeout = CONFIG.collector.timeout;
     }
     loop {
-        write!(&mut io::stdout(), "Select F-key (1 equals F1, etc.) > ");
-        io::stdout().flush();
-        let mut input = user_input();
+        let input = user_input("Select F-key (1 equals F1, etc.) > ".to_string());
         let input_code = match input.trim_right().parse::<u8>().ok() {
             // Not a very nice solution, but I'm unsure if I could make it nicer.
             Some(1u8) => 0x70,
@@ -297,8 +354,8 @@ fn setup(collector: bool) -> Setup {
             Some(7u8) => 0x76,
             Some(8u8) => 0x77,
             Some(9u8) => 0x78,
-            None => panic!("{} is numberwang!", input.trim_right()),
-            _ => panic!("{} is numberwang!", input.trim_right()),
+            None => raise_error(format!("{} is numberwang!", input.trim_right())) as u64,
+            _ => raise_error(format!("{} is numberwang!", input.trim_right())) as u64,
         };
         fkey = input_code;
         break;
@@ -311,22 +368,18 @@ fn setup(collector: bool) -> Setup {
 
 fn enum_clients() -> Vec<Client> {
     // Populates `CLIENTS` with metadata about each open client.
-    unsafe extern "system" fn callback(hwnd: winapi::windef::HWND, lparam: i64) -> i32 {
-        let exe: String = CONF["base"]["executable"].clone();
+    unsafe extern "system" fn callback(hwnd: winapi::windef::HWND, _: i64) -> i32 {
+        let exe = CONFIG.base.executable.as_str();
         let lock = CLIENTS.clone();
         let mut vec = lock.lock().unwrap(); // Access the Vec in here...
-        // The function gets angry if it doesn't return a value, so let's use some i32.
-        let mut somei32 = 0i32;
         let mut pid = 0u32;
         if user32::IsWindowVisible(hwnd) != 0 && (user32::IsWindowEnabled(hwnd) != 0) {
             // I wish I didn't need to get the PID on every window, but it's necessary.
             user32::GetWindowThreadProcessId(hwnd, &mut pid as *mut u32);
             let r = get_base_name(pid); // Get the executable name.
-            if &r == exe.as_str() {
+            if &r == exe {
                 // And make sure it matches our target exe name.
-                let conf = Ini::load_from_file("characters.ini").unwrap(); // Get account info.
                 let mut iconized = 0;
-                let mut is_collect = false;
                 let mut rect = winapi::windef::RECT {
                     left: 0i32,
                     top: 0i32,
@@ -351,22 +404,20 @@ fn enum_clients() -> Vec<Client> {
                         break;
                     }
                 }
-                let account = get_name(pid);
-                // Account name will show if the account hasn't been configured in characters.ini.
+                let account = read_account_name(pid).unwrap();
                 let mut name = format!("{} (account name)", account);
-                for (sec, prop) in conf.iter() {
-                    let acc = sec.clone().unwrap();
-                    if acc == account {
-                        let p = prop.clone();
-                        name = p["name"].clone(); // Set the character name from characters.ini.
-                        // Would be ok to accept "true", "yes", 1 and so on if possible..
-                        if p["collect"] == "true" {
-                            is_collect = true;
-                        }
+                let mut collect = false;
+                // Account name will show if the account hasn't been configured in characters.ini.
+                let accounts: Accounts = ConfigFactory::load(Path::new("characters.toml"));
+                for x in accounts.account {
+                    if x.account == account {
+                        collect = x.collect;
+                        name = x.name;
+                        break;
                     }
                 }
                 let client = Client {
-                    collect: is_collect,
+                    collect: collect,
                     pid: pid.to_owned(),
                     hwnd: hwnd.to_owned() as u32,
                     name: name.to_owned(),
@@ -376,14 +427,12 @@ fn enum_clients() -> Vec<Client> {
                 vec.push(client)
             }
         }
-        somei32 = 1;
-        somei32 // Not sure what this helps for, but it's needed...
+        1
     }
     unsafe { user32::EnumWindows(Some(callback), 0i64) };
     let lock = CLIENTS.clone();
-    let mut vec = lock.lock().unwrap();
-    let clients = vec.clone();
-    clients // Return the Vec out here!
+    let vec = lock.lock().unwrap();
+    vec.clone()
 }
 
 fn get_base_name(pid: u32) -> OsString {
@@ -405,20 +454,32 @@ fn get_base_name(pid: u32) -> OsString {
     p // Return the OsString read from K32GetModuleBaseNameW.
 }
 
-fn get_name(pid: u32) -> String {
+fn read_account_name(pid: u32) -> std::result::Result<std::string::String, std::string::FromUtf8Error>  {
     // Reads a memory location and returns the account name.
     let address = get_base_addr(pid);
-    let offset = u32::from_str_radix(CONF["base"]["offset"].trim_right(), 16).ok().unwrap();
+    let offset = u32::from_str_radix(&CONFIG.base.offset, 16).ok().unwrap();
     let pointer = read_memory(pid, address + offset); // get a known pointer to the account name
-    let text = get_text(pid, pointer);
-    text
+    const BUF_LEN: u64 = 16;
+    let mut buffer = [0u8; BUF_LEN as usize];
+    let bytes_read = 0u64;
+    let h_process = unsafe { kernel32::OpenProcess(0x1F0FFF, 0, pid) };
+    unsafe {
+        kernel32::ReadProcessMemory(h_process,
+                                    pointer as winapi::minwindef::LPCVOID,
+                                    buffer.as_mut_ptr() as winapi::minwindef::LPVOID,
+                                    BUF_LEN,
+                                    bytes_read as *mut u64);
+    };
+    unsafe { kernel32::CloseHandle(h_process) };
+    let string = buffer.iter().cloned().filter(|x| *x != 0).collect::<Vec<u8>>();
+    String::from_utf8(string.clone())
 }
 
 fn read_memory(pid: u32, address: u32) -> u32 {
     // Kind of "generic" memory read function, though it only reads a u32 at a specified location.
     const BUF_LEN: u64 = 1;
     let mut buffer = [0u32; 3];
-    let mut bytes_read = 0u64;
+    let bytes_read = 0u64;
     let h_process = unsafe { kernel32::OpenProcess(0x1F0FFF, 0, pid) };
     unsafe {
         kernel32::ReadProcessMemory(h_process,
@@ -434,7 +495,7 @@ fn read_memory(pid: u32, address: u32) -> u32 {
 fn change_pos(pid: u32, address: u32, mut value: [f32; 3]) {
     // Experimental function to teleport a player elsewhere. Functional on shorter teleports.
     const BUF_LEN: u64 = 3;
-    let mut bytes_read = 0u64;
+    let bytes_read = 0u64;
     let h_process = unsafe { kernel32::OpenProcess(0x1F0FFF, 0, pid) };
     unsafe {
         kernel32::WriteProcessMemory(h_process,
@@ -446,22 +507,26 @@ fn change_pos(pid: u32, address: u32, mut value: [f32; 3]) {
     unsafe { kernel32::CloseHandle(h_process) };
 }
 
-fn get_text(pid: u32, address: u32) -> String {
+fn read_buffer(pid: u32, address: u32) -> (String, bool) {
     // Similar to `read_memory`, though this reads a section in memory where the account name lies.
-    const BUF_LEN: u64 = 16;
+    const BUF_LEN: u64 = 2048;
     let mut buffer = [0u8; BUF_LEN as usize];
-    let mut bytes_read = 0u64;
+    let mut stop = false;
+    let bytes_read = 0u64;
     let h_process = unsafe { kernel32::OpenProcess(0x1F0FFF, 0, pid) };
     unsafe {
         kernel32::ReadProcessMemory(h_process,
                                     address as winapi::minwindef::LPCVOID,
                                     buffer.as_mut_ptr() as winapi::minwindef::LPVOID,
-                                    1u64 * BUF_LEN,
+                                    BUF_LEN,
                                     bytes_read as *mut u64);
     };
     unsafe { kernel32::CloseHandle(h_process) };
-    let name = std::str::from_utf8(&buffer[..]).unwrap().to_owned();
-    name.split_terminator('\0').next().unwrap().to_string() // This is really not pretty.
+    let string = buffer.iter().cloned().take_while(|x| *x != 0).collect::<Vec<u8>>();
+    if string.len() < 2048 {
+        stop = true;
+    }
+    (String::from_utf8(string.clone()).unwrap(), stop)
 }
 
 
@@ -519,4 +584,13 @@ fn get_window_pos(hwnd: winapi::windef::HWND) -> winapi::windef::RECT {
         user32::GetWindowRect(hwnd, &mut rect as *mut winapi::windef::RECT);
     };
     rect
+}
+
+fn raise_error(errmsg: String) -> usize {
+     let _  = unsafe { user32::MessageBoxW(0 as winapi::windef::HWND,
+                                           errmsg.to_wide_null().as_ptr(),
+                                           errmsg.to_wide_null().as_ptr(),
+                                           0u32)};
+     panic!(errmsg);
+     0
 }
